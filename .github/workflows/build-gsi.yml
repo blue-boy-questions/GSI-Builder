@@ -1,0 +1,78 @@
+name: Build MysticGSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: Direct URL of the stock firmware archive
+        required: true
+        type: string
+      build_name:
+        description: Output/build name
+        required: true
+        default: mystic-gsi
+        type: string
+      rom_type:
+        description: Patch type, for example hyperos, coloros, oneui, pixel, or generic
+        required: true
+        default: generic
+        type: string
+      no_debloat:
+        description: Keep apps normally removed by the selected patch set
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Maximize runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Checkout MysticGSI
+        uses: actions/checkout@v4
+        with:
+          repository: MysticGSI/mysticgsi
+          ref: main
+          fetch-depth: 1
+
+      - name: Install host tools and Python environment
+        run: |
+          chmod +x setup_host.py
+          ./setup_host.py
+
+      - name: Build GSI
+        env:
+          FIRMWARE_URL: ${{ inputs.firmware_url }}
+          BUILD_NAME: ${{ inputs.build_name }}
+          ROM_TYPE: ${{ inputs.rom_type }}
+          NO_DEBLOAT: ${{ inputs.no_debloat }}
+        run: |
+          set -euxo pipefail
+          args=(build "$BUILD_NAME" "$FIRMWARE_URL" --type "$ROM_TYPE" --compress)
+          if [[ "$NO_DEBLOAT" == "true" ]]; then args+=(--no-debloat); fi
+          .venv/bin/python cli.py "${args[@]}"
+          find "out/$BUILD_NAME" -maxdepth 2 -type f -printf '%p %s bytes\n'
+          sha256sum "out/$BUILD_NAME"/* > "out/$BUILD_NAME/SHA256SUMS"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_name }}
+          path: out/${{ inputs.build_name }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

@@ -1,0 +1,6 @@
+out/
+tmp/
+.venv/
+__pycache__/
+*.img
+*.zip
