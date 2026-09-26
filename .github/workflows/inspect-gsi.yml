@@ -1,0 +1,101 @@
+name: Inspect GSI classpath and allowlist
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag holding the .img.xz asset
+        required: true
+        default: A346E-OneUI-GSI-20260926
+        type: string
+      asset_name:
+        description: Compressed image asset name
+        required: true
+        default: Oneui-a34x-16-A346EXXSDEZB6-AB-20260926-MysticGSI.img.xz
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Download release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ inputs.asset_name }}
+        run: |
+          set -euxo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
+          ls -la
+
+      - name: Decompress image
+        env:
+          ASSET: ${{ inputs.asset_name }}
+        run: |
+          set -euxo pipefail
+          xz -d -T0 "$ASSET"
+          ls -la ./*.img
+
+      - name: Mount and inspect
+        run: |
+          set -uo pipefail
+          IMG=$(ls ./*.img | head -n1)
+          echo "IMG=$IMG size=$(stat -c%s "$IMG")"
+          mkdir -p mnt
+          # GSI is a raw ext4 with an AVB hashtree footer; a plain read-only
+          # loop mount ignores the trailing metadata.
+          sudo mount -o ro,loop "$IMG" mnt || { echo "mount failed"; sudo dmesg | tail -20; exit 1; }
+          echo "=== MOUNTED ==="
+          ls mnt
+
+          echo; echo "=== classpath fragments (.pb) ==="
+          for d in system/etc/classpaths system_ext/etc/classpaths product/etc/classpaths; do
+            echo "-- mnt/$d"
+            ls -la "mnt/$d" 2>/dev/null || echo "  (none)"
+          done
+
+          echo; echo "=== strings mentioning mediatek/jar in every .pb ==="
+          for f in $(find mnt -path '*/etc/classpaths/*.pb' 2>/dev/null); do
+            echo "== $f"
+            strings "$f" | grep -iE 'mediatek|\.jar' || echo "  (no jar/mediatek strings)"
+          done
+
+          echo; echo "=== does mediatek-common.jar exist inside GSI? ==="
+          find mnt -name 'mediatek-common.jar' -printf '%p %s bytes\n' 2>/dev/null || echo "  (not found)"
+
+          echo; echo "=== sysconfig files ==="
+          for d in system/etc/sysconfig system_ext/etc/sysconfig product/etc/sysconfig; do
+            echo "-- mnt/$d"
+            ls "mnt/$d" 2>/dev/null || echo "  (none)"
+          done
+
+          echo; echo "=== any sysconfig referencing mediatek / system-server ==="
+          grep -rilE 'mediatek|system-server|systemserver|standalone' mnt/system/etc/sysconfig mnt/system_ext/etc/sysconfig mnt/product/etc/sysconfig 2>/dev/null || echo "  (none)"
+
+          echo; echo "=== build.prop lines with SYSTEMSERVER / mediatek ==="
+          for p in mnt/system/build.prop mnt/system/system/build.prop mnt/system_ext/build.prop mnt/product/build.prop; do
+            [ -f "$p" ] && { echo "-- $p"; grep -iE 'systemserver|mediatek|classpath' "$p" || true; }
+          done
+
+          echo; echo "=== derive_classpath fragments raw dump (base64, small) ==="
+          for f in $(find mnt -path '*/etc/classpaths/*.pb' 2>/dev/null); do
+            echo "== $f (base64) =="
+            base64 "$f"
+          done
+
+          sudo umount mnt || true
