@@ -13,11 +13,11 @@ on:
         required: true
         default: Oneui-a34x-16-A346EXXSDEZB6-AB-20260926-MysticGSI.img.xz
         type: string
-      inspect_only:
-        description: Only inspect symlink layout, do not patch
+      out_tag:
+        description: Release tag to publish the fixed image under
         required: true
-        default: true
-        type: boolean
+        default: A346E-OneUI-GSI-v2-symlinkfix
+        type: string
 
 permissions:
   contents: write
@@ -25,7 +25,7 @@ permissions:
 jobs:
   fix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -38,8 +38,18 @@ jobs:
           docker-images: true
           swap-storage: false
 
+      - name: Checkout MysticGSI (for bundled avbtool)
+        uses: actions/checkout@v4
+        with:
+          repository: MysticGSI/mysticgsi
+          ref: main
+          fetch-depth: 1
+          path: mysticgsi
+
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs python3 openssl
 
       - name: Download and decompress
         env:
@@ -51,28 +61,97 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
           xz -d -T0 "$ASSET"
           ls -la ./*.img
-
-      - name: Inspect symlink layout
-        run: |
-          set -uo pipefail
           IMG=$(ls ./*.img | head -n1)
-          echo "IMG=$IMG"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          # Record original AVB footer info (so we know the image had a hashtree).
+          python3 mysticgsi/tools/avb/avbtool.py info_image --image "$IMG" > avb_before.txt 2>&1 || true
+          sed -n '1,40p' avb_before.txt
+
+      - name: Strip AVB footer and grow for read-write mount
+        run: |
+          set -euxo pipefail
+          # avbtool erase_footer restores the raw filesystem size (removes the
+          # hashtree + vbmeta footer appended at build time).
+          python3 mysticgsi/tools/avb/avbtool.py erase_footer --image "$IMG" || true
+          # Give ext4 headroom so moving the system_ext tree cannot ENOSPC.
+          CUR=$(stat -c%s "$IMG")
+          NEW=$(( CUR + 256*1024*1024 ))
+          truncate -s "$NEW" "$IMG"
+          e2fsck -f -y "$IMG" || true
+          resize2fs "$IMG"
+          e2fsck -f -y "$IMG" || true
+
+      - name: Apply symlink swap for system_ext and product
+        run: |
+          set -euxo pipefail
           mkdir -p mnt
-          sudo mount -o ro,loop "$IMG" mnt
-          echo "=== top-level entries (long) ==="
-          ls -la mnt | grep -E 'system_ext|product|system_dlkm|vendor' || true
-          echo; echo "=== is mnt/system_ext a symlink? ==="
-          if [ -L mnt/system_ext ]; then echo "mnt/system_ext SYMLINK -> $(readlink mnt/system_ext)"; elif [ -d mnt/system_ext ]; then echo "mnt/system_ext REAL DIR"; else echo "mnt/system_ext MISSING"; fi
-          echo; echo "=== is mnt/system/system_ext a symlink? ==="
-          if [ -L mnt/system/system_ext ]; then echo "mnt/system/system_ext SYMLINK -> $(readlink mnt/system/system_ext)"; elif [ -d mnt/system/system_ext ]; then echo "mnt/system/system_ext REAL DIR"; else echo "mnt/system/system_ext MISSING"; fi
-          echo; echo "=== where do the mediatek jars physically resolve? ==="
+          sudo mount -o loop,rw "$IMG" mnt
+          fix_partition() {
+            local name="$1"          # system_ext | product
+            echo "=== fixing /$name ==="
+            if [ -L "mnt/$name" ]; then
+              echo "removing rootfs symlink mnt/$name -> $(readlink mnt/$name)"
+              sudo rm "mnt/$name"
+            fi
+            if [ -d "mnt/system/$name" ] && [ ! -L "mnt/system/$name" ]; then
+              echo "moving real dir mnt/system/$name -> mnt/$name"
+              sudo mv "mnt/system/$name" "mnt/$name"
+              echo "replacing mnt/system/$name with symlink -> /$name (stock layout)"
+              sudo ln -s "/$name" "mnt/system/$name"
+            else
+              echo "WARN: mnt/system/$name is not a real dir; skipping"
+            fi
+          }
+          fix_partition system_ext
+          fix_partition product
+          echo "=== verify new layout ==="
+          ls -ld mnt/system_ext mnt/product mnt/system/system_ext mnt/system/product || true
+          echo "--- system_ext is now:" ; if [ -L mnt/system_ext ]; then echo SYMLINK; elif [ -d mnt/system_ext ]; then echo REALDIR; fi
+          echo "--- mediatek jars now resolve to:"
           for j in mediatek-common mediatek-framework mediatek-ims-base; do
-            for base in mnt/system_ext/framework mnt/system/system_ext/framework; do
-              p="$base/$j.jar"
-              if [ -e "$p" ]; then echo "$p -> realpath: $(realpath --relative-to=mnt "$p" 2>/dev/null || readlink -f "$p")"; fi
-            done
+            realpath --relative-to=mnt "mnt/system_ext/framework/$j.jar" 2>/dev/null || true
           done
-          echo; echo "=== same check for product ==="
-          if [ -L mnt/product ]; then echo "mnt/product SYMLINK -> $(readlink mnt/product)"; elif [ -d mnt/product ]; then echo "mnt/product REAL DIR"; fi
-          if [ -L mnt/system/product ]; then echo "mnt/system/product SYMLINK -> $(readlink mnt/system/product)"; elif [ -d mnt/system/product ]; then echo "mnt/system/product REAL DIR"; fi
+          sync
           sudo umount mnt
+
+      - name: Shrink, check, and re-sign AVB
+        run: |
+          set -euxo pipefail
+          e2fsck -f -y "$IMG" || true
+          # Shrink back to minimum so the published image is not bloated.
+          resize2fs -M "$IMG"
+          e2fsck -f -y "$IMG" || true
+          # Re-add an AVB hashtree footer with the AOSP test key (same as build).
+          KEY=mysticgsi/tools/avb/testkey_rsa2048.pem
+          python3 mysticgsi/tools/avb/avbtool.py add_hashtree_footer \
+            --image "$IMG" \
+            --partition_name system \
+            --hash_algorithm sha256 \
+            --key "$KEY" \
+            --algorithm SHA256_RSA2048
+          python3 mysticgsi/tools/avb/avbtool.py info_image --image "$IMG" | sed -n '1,40p'
+
+      - name: Rename, compress, checksum
+        id: pack
+        run: |
+          set -euxo pipefail
+          OUT="Oneui-a34x-16-A346EXXSDEZB6-AB-symlinkfix.img"
+          mv "$IMG" "$OUT"
+          ls -la "$OUT"
+          stat -c '%n %s bytes' "$OUT"
+          xz -9e -T0 --keep "$OUT"
+          sha256sum "$OUT" "$OUT.xz" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "asset=$OUT.xz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish fixed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_TAG: ${{ inputs.out_tag }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+        run: |
+          set -euxo pipefail
+          gh release create "$OUT_TAG" "$ASSET" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "A346E One UI GSI - symlink allowlist fix (v2)" \
+            --notes "Fix #1 from the KJ5 reference port: /system_ext and /product converted from rootfs symlinks to real directories so BOOTCLASSPATH mediatek-*.jar pass zygote's fd allowlist (resolves 'Not allowlisted' bootloop). Decompress before DSU/fastboot. Re-signed with AOSP AVB test key."
