@@ -128,7 +128,8 @@ jobs:
             --partition_name system \
             --hash_algorithm sha256 \
             --key "$KEY" \
-            --algorithm SHA256_RSA2048
+            --algorithm SHA256_RSA2048 \
+            --do_not_generate_fec
           python3 mysticgsi/tools/avb/avbtool.py info_image --image "$IMG" | sed -n '1,40p'
 
       - name: Rename, compress, checksum
