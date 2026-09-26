@@ -1,0 +1,76 @@
+name: Publish ultra-compressed GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful build run ID
+        required: true
+        default: "36245368566"
+        type: string
+      artifact_name:
+        description: Source workflow artifact name
+        required: true
+        default: A346E-OneUI-GSI
+        type: string
+      release_tag:
+        description: GitHub Release tag
+        required: true
+        default: A346E-OneUI-GSI-20260926
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Free runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: source
+
+      - name: Create ultra-compressed image
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG=$(find source -type f -name '*.img' -print -quit)
+          test -n "$IMG"
+          BASE=$(basename "$IMG" .img)
+          OUT="${BASE}.img.xz"
+          xz --threads=0 -9e --keep --stdout "$IMG" > "$OUT"
+          sha256sum "$OUT" > "${OUT}.sha256"
+          printf 'asset=%s\n' "$OUT" >> "$GITHUB_OUTPUT"
+          stat --printf='%n %s bytes\n' "$IMG" "$OUT"
+          xz --test "$OUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+          SRC_RUN: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "$ASSET" "${ASSET}.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "A346E One UI GSI ultra-compressed" \
+            --notes "Ultra-compressed XZ image built from workflow run ${SRC_RUN}. Decompress before DSU installation."
