@@ -1,0 +1,78 @@
+name: Fix GSI system_ext allowlist
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag holding the source .img.xz
+        required: true
+        default: A346E-OneUI-GSI-20260926
+        type: string
+      asset_name:
+        description: Source compressed image asset
+        required: true
+        default: Oneui-a34x-16-A346EXXSDEZB6-AB-20260926-MysticGSI.img.xz
+        type: string
+      inspect_only:
+        description: Only inspect symlink layout, do not patch
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Download and decompress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ inputs.asset_name }}
+        run: |
+          set -euxo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
+          xz -d -T0 "$ASSET"
+          ls -la ./*.img
+
+      - name: Inspect symlink layout
+        run: |
+          set -uo pipefail
+          IMG=$(ls ./*.img | head -n1)
+          echo "IMG=$IMG"
+          mkdir -p mnt
+          sudo mount -o ro,loop "$IMG" mnt
+          echo "=== top-level entries (long) ==="
+          ls -la mnt | grep -E 'system_ext|product|system_dlkm|vendor' || true
+          echo; echo "=== is mnt/system_ext a symlink? ==="
+          if [ -L mnt/system_ext ]; then echo "mnt/system_ext SYMLINK -> $(readlink mnt/system_ext)"; elif [ -d mnt/system_ext ]; then echo "mnt/system_ext REAL DIR"; else echo "mnt/system_ext MISSING"; fi
+          echo; echo "=== is mnt/system/system_ext a symlink? ==="
+          if [ -L mnt/system/system_ext ]; then echo "mnt/system/system_ext SYMLINK -> $(readlink mnt/system/system_ext)"; elif [ -d mnt/system/system_ext ]; then echo "mnt/system/system_ext REAL DIR"; else echo "mnt/system/system_ext MISSING"; fi
+          echo; echo "=== where do the mediatek jars physically resolve? ==="
+          for j in mediatek-common mediatek-framework mediatek-ims-base; do
+            for base in mnt/system_ext/framework mnt/system/system_ext/framework; do
+              p="$base/$j.jar"
+              if [ -e "$p" ]; then echo "$p -> realpath: $(realpath --relative-to=mnt "$p" 2>/dev/null || readlink -f "$p")"; fi
+            done
+          done
+          echo; echo "=== same check for product ==="
+          if [ -L mnt/product ]; then echo "mnt/product SYMLINK -> $(readlink mnt/product)"; elif [ -d mnt/product ]; then echo "mnt/product REAL DIR"; fi
+          if [ -L mnt/system/product ]; then echo "mnt/system/product SYMLINK -> $(readlink mnt/system/product)"; elif [ -d mnt/system/product ]; then echo "mnt/system/product REAL DIR"; fi
+          sudo umount mnt
