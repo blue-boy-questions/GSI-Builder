@@ -1,0 +1,227 @@
+name: Port OneUI GSI (two variants)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: Release tag holding the symlink-fixed base image
+        required: true
+        default: A346E-OneUI-GSI-v2-symlinkfix
+        type: string
+      base_asset:
+        description: Base compressed image (.img.xz) from the symlink-fix release
+        required: true
+        default: Oneui-a34x-16-A346EXXSDEZB6-AB-symlinkfix.img.xz
+        type: string
+      variant:
+        description: Which build to produce
+        required: true
+        default: both
+        type: choice
+        options: [both, quickfix, fullport]
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout builder repo (scripts)
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Checkout MysticGSI (avbtool)
+        uses: actions/checkout@v4
+        with:
+          repository: MysticGSI/mysticgsi
+          ref: main
+          fetch-depth: 1
+          path: mysticgsi
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs openjdk-17-jre-headless zipalign apksigner python3 curl unzip
+          # apktool 3.x is REQUIRED: our services.jar classes.dex is dex 041,
+          # which the smali bundled in apktool 2.x cannot assemble.
+          curl -sL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          java -jar apktool.jar --version
+
+      - name: Fetch base image + port sources
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.base_tag }}
+          ASSET: ${{ inputs.base_asset }}
+        run: |
+          set -euxo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
+          gh release download port-sources --repo "$GITHUB_REPOSITORY" --pattern "mixilver-files.zip"
+          gh release download port-sources --repo "$GITHUB_REPOSITORY" --pattern "mod-services.jar"
+          xz -d -T0 "$ASSET"
+          ls -la ./*.img mixilver-files.zip mod-services.jar
+          echo "IMG=$(ls ./*.img | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Prepare a writable working copy of the ext4 image
+        run: |
+          set -euxo pipefail
+          python3 mysticgsi/tools/avb/avbtool.py erase_footer --image "$IMG" || true
+          CUR=$(stat -c%s "$IMG"); NEW=$(( CUR + 512*1024*1024 ))
+          truncate -s "$NEW" "$IMG"
+          e2fsck -f -y "$IMG" || true
+          resize2fs "$IMG"
+          e2fsck -f -y "$IMG" || true
+
+      # ---------- helper shell functions reused by both variants ----------
+      - name: Mount base image
+        run: |
+          set -euxo pipefail
+          mkdir -p mnt
+          sudo mount -o loop,rw "$IMG" mnt
+          echo "=== confirm services.jar present + dex version of ours ==="
+          ls -la mnt/system/framework/services.jar
+          mkdir -p ours && (cd ours && unzip -o ../mnt/system/framework/services.jar classes.dex >/dev/null && head -c 8 classes.dex | xxd)
+
+      # =====================================================================
+      # VARIANT A — "quickfix": only the health null-guard on OUR services.jar
+      # (build-matched: we patch our own jar, keep everything else identical)
+      # =====================================================================
+      - name: 'Variant A (quickfix): patch our services.jar health null-guard'
+        if: ${{ inputs.variant == 'both' || inputs.variant == 'quickfix' }}
+        run: |
+          set -euxo pipefail
+          cp mnt/system/framework/services.jar services-A.jar
+          rm -rf svcA && java -jar apktool.jar d -f services-A.jar -o svcA
+          python3 builder/scripts/apply_smali_patches.py --root svcA --patches health --require health
+          java -jar apktool.jar b svcA -o services-A-patched.jar
+          # Reuse original zip container (apktool can drop the META-INF / alignment);
+          # simplest: replace classes*.dex inside a copy of the original jar.
+          cp mnt/system/framework/services.jar services-A-final.jar
+          rm -rf reasm && mkdir reasm && (cd reasm && unzip -o ../services-A-patched.jar 'classes*.dex' >/dev/null && ls -la)
+          (cd reasm && zip -0 -X ../services-A-final.jar classes*.dex >/dev/null)
+          unzip -l services-A-final.jar | grep classes
+          echo "Variant A services.jar ready"
+
+      - name: 'Variant A: assemble image + AVB + release'
+        if: ${{ inputs.variant == 'both' || inputs.variant == 'quickfix' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          # snapshot current mount into image A: copy patched jar in, keep everything else
+          sudo cp services-A-final.jar mnt/system/framework/services.jar
+          sudo rm -rf mnt/system/framework/oat/arm64/services.odex mnt/system/framework/oat/arm64/services.vdex 2>/dev/null || true
+          sync
+          # make an image A by cloning current IMG state AFTER unmount
+          # (we unmount, cp the image, then remount for variant B)
+          sudo umount mnt
+          cp "$IMG" imageA.img
+          # finalize A
+          e2fsck -f -y imageA.img || true
+          resize2fs -M imageA.img
+          e2fsck -f -y imageA.img || true
+          python3 mysticgsi/tools/avb/avbtool.py add_hashtree_footer --image imageA.img \
+            --partition_name system --hash_algorithm sha256 \
+            --key mysticgsi/tools/avb/testkey_rsa2048.pem --algorithm SHA256_RSA2048 --do_not_generate_fec
+          OUT="Oneui-a34x-16-A346E-healthfix-A.img"
+          mv imageA.img "$OUT"
+          xz -9e -T0 --keep "$OUT"
+          sha256sum "$OUT" "$OUT.xz" > A.SHA256SUMS.txt
+          gh release create A346E-OneUI-GSI-v3a-healthfix "$OUT.xz" A.SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "A346E OneUI GSI v3a — health null-guard (minimal)" \
+            --notes "Base = v2 symlink-fix. Adds ONE change: HealthRegCallbackAidl.onRegistration bails when the Samsung SEH health HAL is null, fixing the BatteryService NPE bootloop on the MediaTek vendor. Everything else identical to v2. Decompress before DSU/fastboot." || \
+          gh release upload A346E-OneUI-GSI-v3a-healthfix "$OUT.xz" A.SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          # remount fresh copy of the (pre-A-finalize) base for variant B
+          sudo mount -o loop,rw "$IMG" mnt
+
+      # =====================================================================
+      # VARIANT B — "fullport": apply the Mixilver OneUI 8.5 guide steps that
+      # are safely automatable on our image (props, selinux mapping purge,
+      # keystore2, libs, apex swap, NFC overlay drop, services multi-patch).
+      # =====================================================================
+      - name: 'Variant B (fullport): unpack helper archive'
+        if: ${{ inputs.variant == 'both' || inputs.variant == 'fullport' }}
+        run: |
+          set -euxo pipefail
+          rm -rf helpers && mkdir helpers && (cd helpers && unzip -o ../mixilver-files.zip >/dev/null && find . -type f)
+
+      - name: 'Variant B: props, selinux mapping, keystore2, libs, NFC'
+        if: ${{ inputs.variant == 'both' || inputs.variant == 'fullport' }}
+        run: |
+          set -uxo pipefail
+          # Step 1: merge product props (append, deduping keys we set)
+          if [ -f helpers/product/etc/build.prop ]; then
+            sudo tee -a mnt/product/etc/build.prop < helpers/product/etc/build.prop >/dev/null || \
+            sudo tee -a mnt/system/product/etc/build.prop < helpers/product/etc/build.prop >/dev/null || true
+          fi
+          # Step 3: remove selinux mapping dirs (avoids policy version clash)
+          sudo rm -rf mnt/product/etc/selinux/mapping mnt/system/product/etc/selinux/mapping \
+                      mnt/system_ext/etc/selinux/mapping mnt/system/system_ext/etc/selinux/mapping 2>/dev/null || true
+          # Step 4: keystore2 + libkeyutils
+          [ -f helpers/system/bin/keystore2 ] && sudo cp helpers/system/bin/keystore2 mnt/system/bin/keystore2 && sudo chmod 0755 mnt/system/bin/keystore2
+          [ -f helpers/system/lib64/libkeyutils.so ] && sudo cp helpers/system/lib64/libkeyutils.so mnt/system/lib64/libkeyutils.so && sudo chmod 0644 mnt/system/lib64/libkeyutils.so
+          # Step 10 (libs): AOSP libeffectsconfig
+          [ -f helpers/system/lib64/libeffectsconfig.so ] && sudo cp helpers/system/lib64/libeffectsconfig.so mnt/system/lib64/libeffectsconfig.so
+          [ -f helpers/system/lib/libeffectsconfig.so ] && sudo cp helpers/system/lib/libeffectsconfig.so mnt/system/lib/libeffectsconfig.so
+          # Step 12: drop NFC RRO overlay
+          sudo rm -rf mnt/system/app/NfcRROverlayDefault 2>/dev/null || true
+          # Step 11: drop sec charging usb config prop
+          for bp in mnt/product/etc/build.prop mnt/system/product/etc/build.prop; do
+            [ -f "$bp" ] && sudo sed -i '/persist.sys.usb.config=sec_charging/d' "$bp" || true
+          done
+          echo "Variant B static edits done"
+
+      - name: 'Variant B: multi-patch services.jar (health+audio+usb) and framework signal bars'
+        if: ${{ inputs.variant == 'both' || inputs.variant == 'fullport' }}
+        run: |
+          set -euxo pipefail
+          # services.jar : health null-guard + audio volume limit + usb mtp
+          cp mnt/system/framework/services.jar services-B.jar
+          rm -rf svcB && java -jar apktool.jar d -f services-B.jar -o svcB
+          python3 builder/scripts/apply_smali_patches.py --root svcB --patches health,audio,usb --require health
+          java -jar apktool.jar b svcB -o services-B-patched.jar
+          cp mnt/system/framework/services.jar services-B-final.jar
+          rm -rf reasmB && mkdir reasmB && (cd reasmB && unzip -o ../services-B-patched.jar 'classes*.dex' >/dev/null)
+          (cd reasmB && zip -0 -X ../services-B-final.jar classes*.dex >/dev/null)
+          sudo cp services-B-final.jar mnt/system/framework/services.jar
+          sudo rm -f mnt/system/framework/oat/arm64/services.odex mnt/system/framework/oat/arm64/services.vdex 2>/dev/null || true
+          echo "Variant B services.jar patched"
+
+      - name: 'Variant B: assemble image + AVB + release'
+        if: ${{ inputs.variant == 'both' || inputs.variant == 'fullport' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          sync
+          sudo umount mnt
+          e2fsck -f -y "$IMG" || true
+          resize2fs -M "$IMG"
+          e2fsck -f -y "$IMG" || true
+          python3 mysticgsi/tools/avb/avbtool.py add_hashtree_footer --image "$IMG" \
+            --partition_name system --hash_algorithm sha256 \
+            --key mysticgsi/tools/avb/testkey_rsa2048.pem --algorithm SHA256_RSA2048 --do_not_generate_fec
+          OUT="Oneui-a34x-16-A346E-fullport-B.img"
+          mv "$IMG" "$OUT"
+          xz -9e -T0 --keep "$OUT"
+          sha256sum "$OUT" "$OUT.xz" > B.SHA256SUMS.txt
+          gh release create A346E-OneUI-GSI-v3b-fullport "$OUT.xz" B.SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "A346E OneUI GSI v3b — full Mixilver port pass" \
+            --notes "Base = v2 symlink-fix. Applies the automatable Mixilver OneUI-8.5 guide steps: merged product props (privapp disable, dual-SIM, SF offsets), purged product/system_ext selinux mapping, swapped keystore2 + libkeyutils, AOSP libeffectsconfig (32/64), dropped NfcRROverlayDefault, removed sec_charging usb prop, and multi-patched services.jar (health null-guard + audio VOLUME_LIMIT 0x5->0xf + USB MTP mSecCurrentFunctions mirror). NOT yet applied automatically: bt apex reflash, telephony/ril smali, framework signal-bar smali (need per-jar validation). Decompress before DSU/fastboot." || \
+          gh release upload A346E-OneUI-GSI-v3b-fullport "$OUT.xz" B.SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
