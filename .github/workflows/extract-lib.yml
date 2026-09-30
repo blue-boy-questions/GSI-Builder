@@ -1,0 +1,73 @@
+name: Extract a lib from the GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: Release tag holding the base image
+        required: true
+        default: A346E-OneUI-GSI-v2-symlinkfix
+        type: string
+      base_asset:
+        description: Base compressed image (.img.xz)
+        required: true
+        default: Oneui-a34x-16-A346EXXSDEZB6-AB-symlinkfix.img.xz
+        type: string
+      lib_path:
+        description: Path inside system to extract
+        required: true
+        default: system/lib64/libvibratorservice.so
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Download and decompress base image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.base_tag }}
+          ASSET: ${{ inputs.base_asset }}
+        run: |
+          set -euxo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
+          xz -d -T0 "$ASSET"
+          echo "IMG=$(ls ./*.img | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Mount and copy lib
+        run: |
+          set -euxo pipefail
+          mkdir -p mnt out
+          sudo mount -o ro,loop "$IMG" mnt
+          LP="mnt/${{ inputs.lib_path }}"
+          ls -la "$LP"
+          cp "$LP" out/
+          # also grab nm symbols for offset math (need llvm-nm / objdump for aarch64)
+          sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu >/dev/null 2>&1 || true
+          BN=$(basename "${{ inputs.lib_path }}")
+          aarch64-linux-gnu-nm -C --defined-only "out/$BN" 2>/dev/null | grep -iE 'supportsHapticEngine|getSehHal|SehHal|AidlHalWrapper' > out/symbols.txt || true
+          echo "=== symbols of interest ==="
+          cat out/symbols.txt || echo "(nm produced nothing; lib may be stripped)"
+          sha256sum "out/$BN" | tee out/sha256.txt
+          sudo umount mnt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-lib
+          path: out/
+          retention-days: 7
