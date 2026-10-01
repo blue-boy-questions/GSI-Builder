@@ -113,7 +113,8 @@ jobs:
           LP=mnt/system/lib64/libvibratorservice.so
           ls -la "$LP"
           sudo cp "$LP" ./libvib.so
-          sudo chmod +w ./libvib.so
+          sudo chown "$(id -u):$(id -g)" ./libvib.so
+          chmod u+w ./libvib.so
           python3 builder/scripts/patch_vibrator.py --so ./libvib.so
           sudo cp ./libvib.so "$LP"
           echo "vibrator patched"
