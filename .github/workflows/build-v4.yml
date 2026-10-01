@@ -1,0 +1,145 @@
+name: Build v4 (fullport + vibrator null-safe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: Release tag with the symlink-fixed base image
+        required: true
+        default: A346E-OneUI-GSI-v2-symlinkfix
+        type: string
+      base_asset:
+        description: Base compressed image (.img.xz)
+        required: true
+        default: Oneui-a34x-16-A346EXXSDEZB6-AB-symlinkfix.img.xz
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout builder (scripts)
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Checkout MysticGSI (avbtool)
+        uses: actions/checkout@v4
+        with:
+          repository: MysticGSI/mysticgsi
+          ref: main
+          fetch-depth: 1
+          path: mysticgsi
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs openjdk-17-jre-headless python3 curl unzip python3-pip
+          pip3 install --quiet capstone pyelftools
+          curl -sL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+
+      - name: Fetch base image + port sources
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.base_tag }}
+          ASSET: ${{ inputs.base_asset }}
+        run: |
+          set -euxo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
+          gh release download port-sources --repo "$GITHUB_REPOSITORY" --pattern "mixilver-files.zip"
+          xz -d -T0 "$ASSET"
+          echo "IMG=$(ls ./*.img | head -n1)" >> "$GITHUB_ENV"
+
+      - name: Make a writable copy of the ext4
+        run: |
+          set -euxo pipefail
+          python3 mysticgsi/tools/avb/avbtool.py erase_footer --image "$IMG" || true
+          CUR=$(stat -c%s "$IMG"); truncate -s "$(( CUR + 512*1024*1024 ))" "$IMG"
+          e2fsck -f -y "$IMG" || true
+          resize2fs "$IMG"
+          e2fsck -f -y "$IMG" || true
+
+      - name: Mount
+        run: |
+          set -euxo pipefail
+          mkdir -p mnt helpers
+          sudo mount -o loop,rw "$IMG" mnt
+          (cd helpers && unzip -o ../mixilver-files.zip >/dev/null && find . -type f)
+
+      - name: Apply fullport static edits (Mixilver steps 1,3,4,10,11,12)
+        run: |
+          set -uxo pipefail
+          [ -f helpers/product/etc/build.prop ] && { sudo tee -a mnt/product/etc/build.prop < helpers/product/etc/build.prop >/dev/null || sudo tee -a mnt/system/product/etc/build.prop < helpers/product/etc/build.prop >/dev/null || true; }
+          sudo rm -rf mnt/product/etc/selinux/mapping mnt/system/product/etc/selinux/mapping mnt/system_ext/etc/selinux/mapping mnt/system/system_ext/etc/selinux/mapping 2>/dev/null || true
+          [ -f helpers/system/bin/keystore2 ] && { sudo cp helpers/system/bin/keystore2 mnt/system/bin/keystore2; sudo chmod 0755 mnt/system/bin/keystore2; }
+          [ -f helpers/system/lib64/libkeyutils.so ] && { sudo cp helpers/system/lib64/libkeyutils.so mnt/system/lib64/libkeyutils.so; sudo chmod 0644 mnt/system/lib64/libkeyutils.so; }
+          [ -f helpers/system/lib64/libeffectsconfig.so ] && sudo cp helpers/system/lib64/libeffectsconfig.so mnt/system/lib64/libeffectsconfig.so
+          [ -f helpers/system/lib/libeffectsconfig.so ] && sudo cp helpers/system/lib/libeffectsconfig.so mnt/system/lib/libeffectsconfig.so
+          sudo rm -rf mnt/system/app/NfcRROverlayDefault 2>/dev/null || true
+          for bp in mnt/product/etc/build.prop mnt/system/product/etc/build.prop; do [ -f "$bp" ] && sudo sed -i '/persist.sys.usb.config=sec_charging/d' "$bp" || true; done
+          echo "static edits done"
+
+      - name: Patch services.jar (health + audio + usb)
+        run: |
+          set -euxo pipefail
+          cp mnt/system/framework/services.jar services.jar
+          rm -rf svc && java -jar apktool.jar d -f services.jar -o svc
+          python3 builder/scripts/apply_smali_patches.py --root svc --patches health,audio,usb --require health
+          java -jar apktool.jar b svc -o services-patched.jar
+          cp mnt/system/framework/services.jar services-final.jar
+          rm -rf reasm && mkdir reasm && (cd reasm && unzip -o ../services-patched.jar 'classes*.dex' >/dev/null)
+          (cd reasm && zip -0 -X ../services-final.jar classes*.dex >/dev/null)
+          sudo cp services-final.jar mnt/system/framework/services.jar
+          sudo rm -f mnt/system/framework/oat/arm64/services.odex mnt/system/framework/oat/arm64/services.vdex 2>/dev/null || true
+
+      - name: Patch libvibratorservice.so (null-safe SEH)
+        run: |
+          set -euxo pipefail
+          LP=mnt/system/lib64/libvibratorservice.so
+          ls -la "$LP"
+          sudo cp "$LP" ./libvib.so
+          sudo chmod +w ./libvib.so
+          python3 builder/scripts/patch_vibrator.py --so ./libvib.so
+          sudo cp ./libvib.so "$LP"
+          echo "vibrator patched"
+
+      - name: Finalize image + AVB
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          sync
+          sudo umount mnt
+          e2fsck -f -y "$IMG" || true
+          resize2fs -M "$IMG"
+          e2fsck -f -y "$IMG" || true
+          echo "=== RAW IMAGE SIZE (bytes) ==="; stat -c%s "$IMG"
+          python3 mysticgsi/tools/avb/avbtool.py add_hashtree_footer --image "$IMG" \
+            --partition_name system --hash_algorithm sha256 \
+            --key mysticgsi/tools/avb/testkey_rsa2048.pem --algorithm SHA256_RSA2048 --do_not_generate_fec
+          OUT="Oneui-a34x-16-A346E-v4-vibfix.img"
+          mv "$IMG" "$OUT"
+          echo "=== FINAL IMAGE SIZE WITH AVB (bytes) ==="; stat -c%s "$OUT"
+          xz -9e -T0 --keep "$OUT"
+          sha256sum "$OUT" "$OUT.xz" > v4.SHA256SUMS.txt
+          cat v4.SHA256SUMS.txt
+          gh release create A346E-OneUI-GSI-v4-vibfix "$OUT.xz" v4.SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "A346E OneUI GSI v4 — fullport + vibrator null-safe" \
+            --notes "Base = v2 symlink-fix + full Mixilver pass (props/selinux/keystore2/libeffectsconfig/NFC/services health+audio+usb) + binary null-safe patch of libvibratorservice.so supportsHapticEngine (cbz x0 guard at 0x1728c) that fixes the system_server SIGSEGV bootloop on the SEH-less MediaTek vendor. 4-byte in-place edit, image size unchanged by the vibrator patch. Decompress before DSU/fastboot." || \
+          gh release upload A346E-OneUI-GSI-v4-vibfix "$OUT.xz" v4.SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber

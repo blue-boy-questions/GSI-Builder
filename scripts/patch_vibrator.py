@@ -1,116 +1,61 @@
 #!/usr/bin/env python3
-"""Null-safe patch for libvibratorservice.so on non-Samsung (no SEH vibrator HAL) devices.
+"""Deterministic null-safe patch for libvibratorservice.so (A346E / algiz GSI port).
 
-Root cause (confirmed on A346E GSI boot log, matches the KJ5 reference port):
-  system_server SIGSEGV at libvibratorservice.so AidlHalWrapper::supportsHapticEngine()+60
-  -> null pointer dereference. One UI's build calls Samsung's getSehHal() extension and
-     dereferences the returned binder without a null check. On a MediaTek vendor the SEH
-     HAL never registers, so the pointer is null -> crash -> system_server bootloop.
+Confirmed on the A346E GSI boot log (matches the KJ5 reference port, bug #2):
+  system_server SIGSEGV, fault addr 0x0, at
+  libvibratorservice.so  AidlHalWrapper::supportsHapticEngine()+60
 
-Strategy (generic, position-independent):
-  Scan every executable segment for the AArch64 pattern:
-     ldr  Xt, [Xn]           ; load vtable/first field from a pointer in Xn
-  that is immediately reachable right after a `bl <getSehHal-like>` and whose base register
-  was just produced by that call's return (x0). Rather than trying to perfectly identify
-  getSehHal across all 19 sites (fragile), we take the surgical, verifiable approach the
-  reference port used: locate the ONE faulting instruction the log pins down
-  (supportsHapticEngine+60) plus any structurally identical `ldr Xt,[x0]` that dominates a
-  crash on a null SEH handle, and rewrite the *callsite guard*.
+Disassembly of supportsHapticEngine (va 0x17250) shows:
+  0x17280: bl   #0x20a80       ; obtain the SEH HAL handle
+  0x17284: ldr  x0, [sp,#8]    ; x0 = handle (ALWAYS null on a non-Samsung MTK vendor)
+  0x17288: sub  x1, x29,#0xc
+  0x1728c: ldr  x8, [x0]       ; <-- crash: dereference null x0
+  ...
+  0x17310:                     ; clean "unsupported / empty HalResult" return path
+                               ; (sp+0x18 was already zeroed at 0x1727c)
 
-  Because blind opcode rewriting is dangerous, this script instead performs a *targeted*
-  patch driven by a symbol offset supplied on the command line (from the crash log / nm),
-  turning the dereference into a safe "return unsupported" by NOP-ing the load and forcing
-  the boolean result register to 0. Each edit is checksummed and logged; --dry-run prints
-  the planned edits without writing.
+Patch: replace the faulting  `ldr x8,[x0]` (080040f9) at file-offset 0x1728c with
+`cbz x0, #0x17310` (200400b4). On algiz the SEH handle is always null, so the branch
+is always taken into the existing unsupported-return path -> no deref, no crash, basic
+MediaTek vibration keeps working.
 
-This keeps basic vibration (served by the MediaTek legacy HAL) working while every SEH
-haptic query returns "unsupported" instead of crashing.
+This is a surgical 4-byte in-place edit: file size is unchanged. The script refuses to
+run unless the original bytes match exactly (guards against a different build/offset).
 """
 import argparse, struct, sys, hashlib
 
-# AArch64 helpers ---------------------------------------------------------------
-def u32(b, off):
-    return struct.unpack_from("<I", b, off)[0]
-
-def is_ldr_imm_unsigned(word):
-    """LDR Xt, [Xn{,#imm}] 64-bit: size=11, V=0, opc=01 -> 0xF9400000 mask 0xFFC00000."""
-    return (word & 0xFFC00000) == 0xF9400000
-
-def decode_ldr(word):
-    rt = word & 0x1F
-    rn = (word >> 5) & 0x1F
-    imm12 = (word >> 10) & 0xFFF
-    return rt, rn, imm12 * 8
-
-def mov_x_imm0(rt):
-    """MOVZ Xt, #0  -> 0xD2800000 | rt."""
-    return 0xD2800000 | (rt & 0x1F)
-
-# ELF section walk (minimal, .text only via program headers) --------------------
-def elf_exec_ranges(data):
-    assert data[:4] == b"\x7fELF", "not ELF"
-    is64 = data[4] == 2
-    assert is64, "expected ELF64"
-    e_phoff = u64(data, 0x20)
-    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
-    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
-    ranges = []
-    for i in range(e_phnum):
-        base = e_phoff + i * e_phentsize
-        p_type = u32(data, base)
-        p_flags = u32(data, base + 4)
-        p_offset = u64(data, base + 8)
-        p_filesz = u64(data, base + 32)
-        if p_type == 1 and (p_flags & 1):  # PT_LOAD + PF_X
-            ranges.append((p_offset, p_filesz))
-    return ranges
-
-def u64(b, off):
-    return struct.unpack_from("<Q", b, off)[0]
+PATCH_OFFSET = 0x1728C
+ORIG_BYTES   = bytes.fromhex("080040f9")   # ldr x8, [x0]
+# cbz x0, #0x17310  (computed + capstone-verified)
+NEW_BYTES    = bytes.fromhex("200400b4")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--so", required=True, help="path to libvibratorservice.so")
-    ap.add_argument("--sym-offset", type=lambda x:int(x,0), required=True,
-                    help="file offset of the faulting instruction (supportsHapticEngine+60), hex ok")
-    ap.add_argument("--window", type=int, default=8,
-                    help="how many instructions from sym-offset to scan for the null-deref ldr")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     data = bytearray(open(args.so, "rb").read())
-    print(f"[i] file size {len(data)}  sha256(before)={hashlib.sha256(data).hexdigest()[:16]}")
-    ranges = elf_exec_ranges(data)
-    print(f"[i] exec ranges: {[(hex(o),hex(s)) for o,s in ranges]}")
+    before = hashlib.sha256(data).hexdigest()
+    print(f"[i] size={len(data)}  sha256(before)={before}")
 
-    off = args.sym_offset
-    # scan a small window around the faulting site for `ldr Xt,[Xn]` (imm 0) — the classic
-    # first-field / vtable deref of a null binder. Patch it to MOVZ Xt,#0 so the caller sees
-    # a zero handle and its existing failure path returns unsupported.
-    patched = []
-    for k in range(-2, args.window):
-        p = off + k*4
-        if p < 0 or p+4 > len(data):
-            continue
-        w = u32(data, p)
-        if is_ldr_imm_unsigned(w):
-            rt, rn, imm = decode_ldr(w)
-            if imm == 0:
-                new = mov_x_imm0(rt)
-                print(f"[+] {hex(p)}: LDR x{rt},[x{rn}] (0x{w:08x}) -> MOVZ x{rt},#0 (0x{new:08x})")
-                if not args.dry_run:
-                    struct.pack_into("<I", data, p, new)
-                patched.append(p)
-
-    if not patched:
-        print("[!] no null-deref LDR found in window; aborting (no changes)", file=sys.stderr)
+    cur = bytes(data[PATCH_OFFSET:PATCH_OFFSET+4])
+    if cur == NEW_BYTES:
+        print("[=] already patched; nothing to do")
+        return
+    if cur != ORIG_BYTES:
+        print(f"[!] REFUSING: bytes at {PATCH_OFFSET:#x} are {cur.hex()}, "
+              f"expected {ORIG_BYTES.hex()} (wrong build/offset)", file=sys.stderr)
         sys.exit(3)
 
+    print(f"[+] {PATCH_OFFSET:#x}: {cur.hex()} (ldr x8,[x0]) -> {NEW_BYTES.hex()} (cbz x0,#0x17310)")
     if args.dry_run:
-        print(f"[dry-run] would patch {len(patched)} instruction(s); no write")
+        print("[dry-run] no write")
         return
+    data[PATCH_OFFSET:PATCH_OFFSET+4] = NEW_BYTES
     open(args.so, "wb").write(data)
-    print(f"[i] sha256(after)={hashlib.sha256(bytes(data)).hexdigest()[:16]}  patched {len(patched)} site(s)")
+    after = hashlib.sha256(data).hexdigest()
+    print(f"[i] sha256(after)={after}  size={len(data)} (unchanged)")
 
 if __name__ == "__main__":
     main()
